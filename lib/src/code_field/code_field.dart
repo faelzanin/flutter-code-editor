@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -7,17 +8,13 @@ import 'package:linked_scroll_controller/linked_scroll_controller.dart';
 import '../code_theme/code_theme.dart';
 import '../gutter/gutter.dart';
 import '../line_numbers/gutter_style.dart';
-import '../search/widget/search_widget.dart';
 import '../sizes.dart';
 import '../wip/autocomplete/popup.dart';
 import 'actions/comment_uncomment.dart';
-import 'actions/enter_key.dart';
 import 'actions/indent.dart';
 import 'actions/outdent.dart';
-import 'actions/search.dart';
 import 'code_controller.dart';
 import 'default_styles.dart';
-import 'js_workarounds/js_workarounds.dart';
 
 final _shortcuts = <ShortcutActivator, Intent>{
   // Copy
@@ -90,26 +87,6 @@ final _shortcuts = <ShortcutActivator, Intent>{
     LogicalKeyboardKey.slash,
     meta: true,
   ): const CommentUncommentIntent(),
-
-  // Search
-  LogicalKeySet(
-    LogicalKeyboardKey.control,
-    LogicalKeyboardKey.keyF,
-  ): const SearchIntent(),
-  const SingleActivator(
-    LogicalKeyboardKey.keyF,
-    meta: true,
-  ): const SearchIntent(),
-
-  // Dismiss
-  LogicalKeySet(
-    LogicalKeyboardKey.escape,
-  ): const DismissIntent(),
-
-  // EnterKey
-  LogicalKeySet(
-    LogicalKeyboardKey.enter,
-  ): const EnterKeyIntent(),
 };
 
 class CodeField extends StatefulWidget {
@@ -149,9 +126,6 @@ class CodeField extends StatefulWidget {
   final void Function(String)? onChanged;
 
   /// {@macro flutter.widgets.editableText.readOnly}
-  ///
-  /// This is just passed as a parameter to a [TextField].
-  /// See also [CodeController.readOnly].
   final bool readOnly;
 
   final Color? background;
@@ -206,22 +180,17 @@ class _CodeFieldState extends State<CodeField> {
   ScrollController? _horizontalCodeScroll;
   final _codeFieldKey = GlobalKey();
 
-  OverlayEntry? _suggestionsPopup;
-  OverlayEntry? _searchPopup;
   Offset _normalPopupOffset = Offset.zero;
   Offset _flippedPopupOffset = Offset.zero;
   double painterWidth = 0;
   double painterHeight = 0;
 
+  StreamSubscription<bool>? _keyboardVisibilitySubscription;
   FocusNode? _focusNode;
   String? lines;
   String longestLine = '';
-  Size? windowSize;
+  late Size windowSize;
   late TextStyle textStyle;
-  Color? _backgroundCol;
-
-  final _editorKey = GlobalKey();
-  Offset? _editorOffset;
 
   @override
   void initState() {
@@ -232,19 +201,9 @@ class _CodeFieldState extends State<CodeField> {
 
     widget.controller.addListener(_onTextChanged);
     widget.controller.addListener(_updatePopupOffset);
-    widget.controller.popupController.addListener(_onPopupStateChanged);
-    widget.controller.searchController.addListener(
-      _onSearchControllerChange,
-    );
     _horizontalCodeScroll = ScrollController();
     _focusNode = widget.focusNode ?? FocusNode();
     _focusNode!.attach(context, onKeyEvent: _onKeyEvent);
-
-    widget.controller.searchController.codeFieldFocusNode = _focusNode;
-
-    // Workaround for disabling spellchecks in FireFox
-    // https://github.com/akvelon/flutter-code-editor/issues/197
-    disableSpellCheckIfWeb();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final double width = _codeFieldKey.currentContext!.size!.width;
@@ -260,38 +219,13 @@ class _CodeFieldState extends State<CodeField> {
 
   @override
   void dispose() {
-    widget.controller.searchController.codeFieldFocusNode = null;
     widget.controller.removeListener(_onTextChanged);
     widget.controller.removeListener(_updatePopupOffset);
-    widget.controller.popupController.removeListener(_onPopupStateChanged);
-    widget.controller.searchController.removeListener(
-      _onSearchControllerChange,
-    );
-    _searchPopup?.remove();
-    _searchPopup = null;
     _numberScroll?.dispose();
     _codeScroll?.dispose();
     _horizontalCodeScroll?.dispose();
+    unawaited(_keyboardVisibilitySubscription?.cancel());
     super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(covariant CodeField oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    oldWidget.controller.removeListener(_onTextChanged);
-    oldWidget.controller.removeListener(_updatePopupOffset);
-    oldWidget.controller.popupController.removeListener(_onPopupStateChanged);
-    oldWidget.controller.searchController.removeListener(
-      _onSearchControllerChange,
-    );
-
-    widget.controller.searchController.codeFieldFocusNode = _focusNode;
-    widget.controller.addListener(_onTextChanged);
-    widget.controller.addListener(_updatePopupOffset);
-    widget.controller.popupController.addListener(_onPopupStateChanged);
-    widget.controller.searchController.addListener(
-      _onSearchControllerChange,
-    );
   }
 
   void rebuild() {
@@ -324,16 +258,6 @@ class _CodeFieldState extends State<CodeField> {
       if (line.length > longestLine.length) longestLine = line;
     });
 
-    if (_codeScroll != null && _editorKey.currentContext != null) {
-      final box = _editorKey.currentContext!.findRenderObject() as RenderBox?;
-      _editorOffset = box?.localToGlobal(Offset.zero);
-      if (_editorOffset != null) {
-        var fixedOffset = _editorOffset!;
-        fixedOffset += Offset(0, _codeScroll!.offset);
-        _editorOffset = fixedOffset;
-      }
-    }
-
     rebuild();
   }
 
@@ -358,6 +282,7 @@ class _CodeFieldState extends State<CodeField> {
               child: Text(longestLine, style: textStyle),
             ), // Add extra padding
           ),
+          // ignore: prefer_if_elements_to_conditional_expressions
           widget.expands ? Expanded(child: codeField) : codeField,
         ],
       ),
@@ -380,77 +305,23 @@ class _CodeFieldState extends State<CodeField> {
 
     final themeData = Theme.of(context);
     final styles = CodeTheme.of(context)?.styles;
-    _backgroundCol = widget.background ??
+    Color? backgroundCol = widget.background ??
         styles?[rootKey]?.backgroundColor ??
         DefaultStyles.backgroundColor;
 
     if (widget.decoration != null) {
-      _backgroundCol = null;
+      backgroundCol = null;
     }
+
+    const paddingLeft = 8.0;
 
     final defaultTextStyle = TextStyle(
       color: styles?[rootKey]?.color ?? DefaultStyles.textColor,
-      fontSize: themeData.textTheme.titleMedium?.fontSize,
+      fontSize: themeData.textTheme.subtitle1?.fontSize,
     );
 
     textStyle = defaultTextStyle.merge(widget.textStyle);
 
-    final codeField = TextField(
-      focusNode: _focusNode,
-      scrollPadding: widget.padding,
-      style: textStyle,
-      controller: widget.controller,
-      minLines: widget.minLines,
-      maxLines: widget.maxLines,
-      expands: widget.expands,
-      scrollController: _codeScroll,
-      decoration: const InputDecoration(
-        isCollapsed: true,
-        contentPadding: EdgeInsets.symmetric(vertical: 16),
-        disabledBorder: InputBorder.none,
-        border: InputBorder.none,
-        focusedBorder: InputBorder.none,
-      ),
-      cursorColor: widget.cursorColor ?? defaultTextStyle.color,
-      autocorrect: false,
-      enableSuggestions: false,
-      enabled: widget.enabled,
-      onChanged: widget.onChanged,
-      readOnly: widget.readOnly,
-    );
-
-    final editingField = Theme(
-      data: Theme.of(context).copyWith(
-        textSelectionTheme: widget.textSelectionTheme,
-      ),
-      child: LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) {
-          // Control horizontal scrolling
-          return _wrapInScrollView(codeField, textStyle, constraints.maxWidth);
-        },
-      ),
-    );
-
-    return FocusableActionDetector(
-      actions: widget.controller.actions,
-      shortcuts: _shortcuts,
-      child: Container(
-        decoration: widget.decoration,
-        color: _backgroundCol,
-        key: _codeFieldKey,
-        padding: const EdgeInsets.only(left: 8),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (widget.gutterStyle.showGutter) _buildGutter(),
-            Expanded(key: _editorKey, child: editingField),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildGutter() {
     final lineNumberSize = textStyle.fontSize;
     final lineNumberColor =
         widget.gutterStyle.textStyle?.color ?? textStyle.color?.withOpacity(.5);
@@ -465,7 +336,6 @@ class _CodeFieldState extends State<CodeField> {
     final gutterStyle = widget.gutterStyle.copyWith(
       textStyle: lineNumberTextStyle,
       errorPopupTextStyle: widget.gutterStyle.errorPopupTextStyle ??
-          CodeTheme.of(context)?.styles['root'] ??
           textStyle.copyWith(
             fontSize: DefaultStyles.errorPopupTextSize,
             backgroundColor: DefaultStyles.backgroundColor,
@@ -473,19 +343,133 @@ class _CodeFieldState extends State<CodeField> {
           ),
     );
 
-    return GutterWidget(
-      codeController: widget.controller,
-      style: gutterStyle,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        Widget? gutter;
+        if (gutterStyle.showGutter) {
+          final List<int> linesInParagraps;
+          final codeLines = widget.controller.code.lines.lines;
+          if (widget.wrap) {
+            // get wrapped line count in each paragraph
+            const textFieldPadding =
+                paddingLeft + 3; // TODO(emuell): not sure why the 3 is needed!
+            final codeFieldWidth = constraints.maxWidth.floorToDouble() -
+                gutterStyle.totalWidth() -
+                textFieldPadding;
+            linesInParagraps = [];
+            for (var i = 0; i < codeLines.length; ++i) {
+              final codeLine = codeLines[i];
+              // codelines contain an extra newline, except for the last line
+              final text = (i == codeLines.length - 1)
+                  ? codeLine.text
+                  : codeLine.text.replaceAll('\n', '');
+              // create painter with max width
+              final TextPainter paragraphPainter =
+                  _getTextPainter(text, codeFieldWidth);
+              // compute paragraph's metrics to get number of line wraps
+              final lineMetrics = paragraphPainter.computeLineMetrics();
+              linesInParagraps.add(max(1, lineMetrics.length));
+            }
+          } else {
+            // unrwapped editor's show one line per paragraph
+            linesInParagraps = codeLines.map((_) => 1).toList();
+          }
+          gutter = GutterWidget(
+            codeController: widget.controller,
+            style: gutterStyle,
+            linesInParagraps: linesInParagraps,
+          );
+        }
+
+        final codeField = TextField(
+          focusNode: _focusNode,
+          scrollPadding: widget.padding,
+          style: textStyle,
+          controller: widget.controller,
+          minLines: widget.minLines,
+          maxLines: widget.maxLines,
+          expands: widget.expands,
+          scrollController: _codeScroll,
+          decoration: const InputDecoration(
+            isCollapsed: true,
+            contentPadding: EdgeInsets.symmetric(vertical: 16),
+            disabledBorder: InputBorder.none,
+            border: InputBorder.none,
+            focusedBorder: InputBorder.none,
+          ),
+          cursorColor: widget.cursorColor ?? defaultTextStyle.color,
+          autocorrect: false,
+          enableSuggestions: false,
+          enabled: widget.enabled,
+          onChanged: widget.onChanged,
+          readOnly: widget.readOnly,
+        );
+
+        final editingField = Theme(
+          data: Theme.of(context).copyWith(
+            textSelectionTheme: widget.textSelectionTheme,
+          ),
+          child: LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              // Control horizontal scrolling when not wrapping
+              if (widget.wrap) {
+                return codeField;
+              } else {
+                return _wrapInScrollView(
+                  codeField,
+                  textStyle,
+                  constraints.maxWidth,
+                );
+              }
+            },
+          ),
+        );
+
+        return FocusableActionDetector(
+          actions: widget.controller.actions,
+          shortcuts: _shortcuts,
+          child: Container(
+            decoration: widget.decoration,
+            color: backgroundCol,
+            key: _codeFieldKey,
+            padding: const EdgeInsets.only(left: paddingLeft),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (gutter != null) gutter,
+                Expanded(
+                  child: Stack(
+                    children: [
+                      editingField,
+                      if (widget.controller.popupController.isPopupShown)
+                        Popup(
+                          normalOffset: _normalPopupOffset,
+                          flippedOffset: _flippedPopupOffset,
+                          controller: widget.controller.popupController,
+                          editingWindowSize: windowSize,
+                          style: textStyle,
+                          backgroundColor: backgroundCol,
+                          parentFocusNode: _focusNode!,
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
   void _updatePopupOffset() {
-    final textPainter = _getTextPainter(widget.controller.text);
+    final TextPainter textPainter =
+        _getTextPainter(widget.controller.text, double.infinity);
     final caretHeight = _getCaretHeight(textPainter);
 
-    final leftOffset = _getPopupLeftOffset(textPainter);
-    final normalTopOffset = _getPopupTopOffset(textPainter, caretHeight);
-    final flippedTopOffset = normalTopOffset -
+    final double leftOffset = _getPopupLeftOffset(textPainter);
+    final double normalTopOffset = _getPopupTopOffset(textPainter, caretHeight);
+    final double flippedTopOffset = normalTopOffset -
         (Sizes.autocompletePopupMaxHeight + caretHeight + Sizes.caretPadding);
 
     setState(() {
@@ -494,11 +478,11 @@ class _CodeFieldState extends State<CodeField> {
     });
   }
 
-  TextPainter _getTextPainter(String text) {
+  TextPainter _getTextPainter(String text, double maxWidth) {
     return TextPainter(
       textDirection: TextDirection.ltr,
       text: TextSpan(text: text, style: textStyle),
-    )..layout();
+    )..layout(maxWidth: maxWidth);
   }
 
   Offset _getCaretOffset(TextPainter textPainter) {
@@ -520,8 +504,7 @@ class _CodeFieldState extends State<CodeField> {
     return max(
       _getCaretOffset(textPainter).dx +
           widget.padding.left -
-          _horizontalCodeScroll!.offset +
-          (_editorOffset?.dx ?? 0),
+          (widget.wrap ? 0.0 : _horizontalCodeScroll!.offset),
       0,
     );
   }
@@ -532,107 +515,8 @@ class _CodeFieldState extends State<CodeField> {
           caretHeight +
           16 +
           widget.padding.top -
-          _codeScroll!.offset +
-          (_editorOffset?.dy ?? 0),
+          _codeScroll!.offset,
       0,
-    );
-  }
-
-  void _onPopupStateChanged() {
-    final shouldShow =
-        widget.controller.popupController.shouldShow && windowSize != null;
-    if (!shouldShow) {
-      _suggestionsPopup?.remove();
-      _suggestionsPopup = null;
-      return;
-    }
-
-    if (_suggestionsPopup == null) {
-      _suggestionsPopup = _buildSuggestionOverlay();
-      Overlay.of(context).insert(_suggestionsPopup!);
-    }
-
-    _suggestionsPopup!.markNeedsBuild();
-  }
-
-  void _onSearchControllerChange() {
-    final shouldShow = widget.controller.searchController.shouldShow;
-
-    if (!shouldShow) {
-      _searchPopup?.remove();
-      _searchPopup = null;
-      return;
-    }
-
-    if (_searchPopup == null) {
-      _searchPopup = _buildSearchOverlay();
-      Overlay.of(context).insert(_searchPopup!);
-    }
-  }
-
-  OverlayEntry _buildSearchOverlay() {
-    final colorScheme = Theme.of(context).colorScheme;
-    final borderColor = _getTextColorFromTheme() ?? colorScheme.onBackground;
-    return OverlayEntry(
-      builder: (context) {
-        return Positioned(
-          bottom: 10,
-          right: 10,
-          child: Container(
-            clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: borderColor,
-              ),
-              borderRadius: const BorderRadius.all(
-                Radius.circular(5),
-              ),
-            ),
-            child: Material(
-              child: SearchWidget(
-                searchController: widget.controller.searchController,
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Color? _getTextColorFromTheme() {
-    final textTheme = Theme.of(context).textTheme;
-
-    return textTheme.bodyLarge?.color ??
-        textTheme.bodyMedium?.color ??
-        textTheme.bodySmall?.color ??
-        textTheme.displayLarge?.color ??
-        textTheme.displayMedium?.color ??
-        textTheme.displaySmall?.color ??
-        textTheme.headlineLarge?.color ??
-        textTheme.headlineMedium?.color ??
-        textTheme.headlineSmall?.color ??
-        textTheme.labelLarge?.color ??
-        textTheme.labelMedium?.color ??
-        textTheme.labelSmall?.color ??
-        textTheme.titleLarge?.color ??
-        textTheme.titleMedium?.color ??
-        textTheme.titleSmall?.color;
-  }
-
-  OverlayEntry _buildSuggestionOverlay() {
-    return OverlayEntry(
-      builder: (context) {
-        return Popup(
-          normalOffset: _normalPopupOffset,
-          flippedOffset: _flippedPopupOffset,
-          controller: widget.controller.popupController,
-          editingWindowSize: windowSize!,
-          style: textStyle,
-          backgroundColor: _backgroundCol,
-          parentFocusNode: _focusNode!,
-          editorOffset: _editorOffset,
-        );
-      },
     );
   }
 }
